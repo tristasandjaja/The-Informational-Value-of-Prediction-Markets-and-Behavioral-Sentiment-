@@ -1,0 +1,268 @@
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+np.random.seed(42)
+
+DATA_FILE    = "data/raw_data.csv"   
+RESULTS_DIR  = "results"             
+TRAIN_FRAC   = 0.40                        
+THRESHOLD    = 0.50   
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+MODELS = {
+    "M1_Baseline"   : ["r_t", "r_t1", "r_t2"],                       
+    "M2_Sentiment"  : ["r_t", "r_t1", "r_t2", "Sent_t"],             
+    "M3_Integrated" : ["r_t", "r_t1", "r_t2", "Sent_t", "PM_t"],    
+}
+
+
+
+
+def logistic_sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+
+def directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(y_true == y_pred))
+
+
+def rmse(y_true: np.ndarray, prob_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((prob_pred - y_true) ** 2)))
+
+
+
+def diebold_mariano(e1: np.ndarray, e2: np.ndarray,
+                    h: int = 1, criterion: str = "SE") -> dict:
+    
+    
+    if criterion == "SE":
+        d = e1**2 - e2**2    
+    else:
+        d = np.abs(e1) - np.abs(e2)  
+
+    n = len(d)
+    d_bar = np.mean(d)  
+
+    
+    gamma0 = np.var(d, ddof=1)
+    gamma  = gamma0
+    for lag in range(1, h):
+        cov = np.cov(d[lag:], d[:-lag])[0, 1]
+        gamma += 2 * (1 - lag / h) * cov
+
+    
+    lrv = gamma / n
+
+    
+    if lrv <= 0:
+        return {"dm_stat": np.nan, "p_value": np.nan, "better_model": "N/A"}
+
+    
+    dm_stat = d_bar / np.sqrt(lrv)
+
+    
+    k = len(MODELS[list(MODELS.keys())[0]])
+    correction = np.sqrt((n + 1 - 2*h + h*(h-1)/n) / n)
+    dm_stat_corr = dm_stat * correction
+
+    
+    p_val = 2 * (1 - stats.t.cdf(np.abs(dm_stat_corr), df=n - 1))
+
+   
+    better = "M2" if dm_stat_corr > 0 else "M1"
+
+    return {
+        "dm_stat"     : round(dm_stat_corr, 4),
+        "p_value"     : round(p_val, 4),
+        "better_model": better
+    }
+
+
+
+
+def expanding_window_eval(df: pd.DataFrame) -> dict:
+    
+    T   = len(df)           
+    T0  = int(T * TRAIN_FRAC)  
+    n_test = T - T0        
+
+    print(f"\n  Sample size   : {T}")
+    print(f"  Training start: {T0} obs  ({df.index[0].date()} → {df.index[T0-1].date()})")
+    print(f"  Test window   : {n_test} obs  ({df.index[T0].date()} → {df.index[-1].date()})")
+    print()
+
+    results = {}  
+
+    for model_name, features in MODELS.items():
+        
+        probs = np.full(T, np.nan)  
+        preds = np.full(T, np.nan)  
+
+        
+        X_all = df[features].values   
+        y_all = df["y_next"].values   
+
+        
+        for t in range(T0, T):
+
+           
+            X_train = X_all[:t]   
+            y_train = y_all[:t]   
+
+            
+            X_test = X_all[t:t+1] 
+
+            
+            scaler = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train)  
+            X_test_s  = scaler.transform(X_test)        
+
+            
+            clf = LogisticRegression(
+                solver="lbfgs",
+                max_iter=1000,
+                C=1.0,
+                random_state=42
+            )
+            clf.fit(X_train_s, y_train)
+
+            
+            p = clf.predict_proba(X_test_s)[0, 1]
+            probs[t] = p
+
+            
+            preds[t] = int(p > THRESHOLD)
+
+        
+        model_df = pd.DataFrame({
+            "date"      : df.index,
+            "y_actual"  : y_all,      
+            "prob_pred" : probs,       
+            "y_pred"    : preds,       
+        }).set_index("date").iloc[T0:]  
+
+        results[model_name] = model_df
+        print(f"  [{model_name}] done — {n_test} out-of-sample forecasts")
+
+    return results
+
+
+
+def compute_metrics(results: dict) -> pd.DataFrame:
+  
+    rows = []
+    for model_name, df in results.items():
+        valid = df.dropna()  
+
+        
+        da  = directional_accuracy(valid["y_actual"].values, valid["y_pred"].values)
+
+        
+        rms = rmse(valid["y_actual"].values, valid["prob_pred"].values)
+
+        
+        naive_da = max(valid["y_actual"].mean(), 1 - valid["y_actual"].mean())
+
+        rows.append({
+            "Model"            : model_name,
+            "Features"         : str(MODELS[model_name]),
+            "N_test"           : len(valid),
+            "DA (%)"           : round(da * 100, 2),
+            "Naive_DA (%)"     : round(naive_da * 100, 2),
+            "DA_vs_Naive (pp)" : round((da - naive_da) * 100, 2),  
+            "RMSE"             : round(rms, 5),
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+
+def compute_dm_tests(results: dict, df_full: pd.DataFrame) -> pd.DataFrame:
+    
+    comparisons = [
+        ("M2_Sentiment",  "M1_Baseline",  "M2 vs M1 (Sentiment vs Baseline)"),
+        ("M3_Integrated", "M2_Sentiment", "M3 vs M2 (PM vs Sentiment-Aug)"),
+        ("M3_Integrated", "M1_Baseline",  "M3 vs M1 (Overall improvement)"),
+    ]
+
+    rows = []
+    for m_better, m_baseline, label in comparisons:
+        
+        idx = results[m_better].index.intersection(results[m_baseline].index)
+        r_b = results[m_baseline].loc[idx]  
+        r_c = results[m_better].loc[idx]    
+        y   = r_b["y_actual"].values        
+
+        
+        e1 = r_b["prob_pred"].values - y    
+        e2 = r_c["prob_pred"].values - y    
+
+        
+        dm = diebold_mariano(e1, e2)
+
+        rows.append({
+            "Comparison"       : label,
+            "DM Statistic"     : dm["dm_stat"],
+            "p-value"          : dm["p_value"],
+            
+            "Significant (5%)" : "Yes" if (not np.isnan(dm["p_value"]) and dm["p_value"] < 0.05) else "No",
+            "Better Model"     : m_better if (not np.isnan(dm["dm_stat"]) and dm["dm_stat"] > 0) else m_baseline,
+        })
+
+    return pd.DataFrame(rows)
+
+
+
+
+def main():
+    print("\n" + "="*60)
+    print("  MODEL ESTIMATION & EVALUATION")
+    print("="*60)
+
+   
+    df = pd.read_csv(DATA_FILE, index_col="date", parse_dates=True)
+    print(f"  Loaded {len(df)} observations from {DATA_FILE}")
+
+    
+    results = expanding_window_eval(df)
+
+    
+    all_preds = []
+    for model_name, mdf in results.items():
+        temp = mdf.copy()
+        temp["model"] = model_name  
+        all_preds.append(temp)
+    forecast_df = pd.concat(all_preds)
+    forecast_df.to_csv(os.path.join(RESULTS_DIR, "forecast_results.csv"))
+    print(f"\n  Saved forecast series → {RESULTS_DIR}/forecast_results.csv")
+
+    
+    metrics = compute_metrics(results)
+    metrics.to_csv(os.path.join(RESULTS_DIR, "summary_metrics.csv"), index=False)
+    print(f"  Saved metrics table   → {RESULTS_DIR}/summary_metrics.csv")
+    print("\n── Summary Metrics ─────────────────────────────────────")
+    print(metrics[["Model", "DA (%)", "DA_vs_Naive (pp)", "RMSE"]].to_string(index=False))
+
+    
+    dm = compute_dm_tests(results, df)
+    dm.to_csv(os.path.join(RESULTS_DIR, "dm_tests.csv"), index=False)
+    print(f"\n  Saved DM tests        → {RESULTS_DIR}/dm_tests.csv")
+    print("\n── Diebold-Mariano Tests ────────────────────────────────")
+    print(dm.to_string(index=False))
+    print("="*60 + "\n")
+
+    return results, metrics, dm
+
+
+if __name__ == "__main__":
+    main()
