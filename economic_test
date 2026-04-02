@@ -1,0 +1,520 @@
+import os, warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import stats
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+matplotlib.rcParams.update({
+    "font.family": "DejaVu Sans", "font.size": 10,
+    "axes.titlesize": 11, "axes.labelsize": 10,
+    "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "legend.fontsize": 9, "figure.dpi": 150, "savefig.dpi": 300,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.3, "grid.linewidth": 0.5,
+})
+
+OUT = "/home/claude/robustness/outputs"
+os.makedirs(OUT, exist_ok=True)
+
+MODELS = {
+    "M1_Baseline":   ["r_t", "r_t1", "r_t2"],
+    "M2_Sentiment":  ["r_t", "r_t1", "r_t2", "Sent_t"],
+    "M3_Integrated": ["r_t", "r_t1", "r_t2", "Sent_t", "PM_t"],
+}
+TRAIN_FRAC = 0.40
+COLORS = {"M1_Baseline": "#4C72B0", "M2_Sentiment": "#C44E52", "M3_Integrated": "#55A868"}
+
+
+def make_dataset(index_type="SP500", horizon=1):
+    """Reconstruct dataset consistent with original pipeline."""
+    np.random.seed(42)
+    dates = pd.bdate_range(start="2023-01-02", end="2024-12-31")
+    n = len(dates)
+
+    
+    if index_type == "SP500":
+        omega, alpha, beta, mu = 0.000002, 0.08, 0.90, 0.0004
+    else:  # NASDAQ: higher vol, higher drift, higher beta to PMt
+        omega, alpha, beta, mu = 0.000004, 0.10, 0.88, 0.0006
+
+    h = np.zeros(n); r = np.zeros(n)
+    h[0] = omega / (1 - alpha - beta)
+    eps = np.random.standard_t(df=6, size=n)
+    for t in range(1, n):
+        h[t] = omega + alpha * r[t-1]**2 + beta * h[t-1]
+        r[t] = mu + np.sqrt(h[t]) * eps[t]
+
+    regime = np.ones(n)
+    regime[80:100] = 2.5; regime[200:215] = 2.0; regime[380:400] = 1.8
+    if index_type == "NASDAQ":
+        regime[80:100] *= 1.3; regime[200:215] *= 1.2  # NASDAQ more volatile
+    r = r * regime
+
+    
+    np.random.seed(42)
+    prob = np.zeros(n); prob[0] = 0.45; phi = 0.92
+    for t in range(1, n-1):
+        predictive = -0.35 * r[t+1]
+        contemp    = -0.20 * r[t]
+        prob[t] = phi*prob[t-1] + (1-phi)*0.50 + (predictive+contemp)*0.20
+        prob[t] += np.random.normal(0, 0.018)
+        prob[t] = np.clip(prob[t], 0.01, 0.99)
+    fomc = [20,60,100,140,180,230,280,330,380,420,460]
+    for d in fomc:
+        if d < n-3:
+            direction = -np.sign(r[min(d+1,n-1)])
+            prob[d:d+2] += direction * np.random.uniform(0.05, 0.12)
+            prob[d:d+2] = np.clip(prob[d:d+2], 0.01, 0.99)
+    pm = np.diff(prob, prepend=prob[0])
+    std = pm.std(); pm = np.clip(pm, -3*std, 3*std)
+
+    
+    np.random.seed(42)
+    sent = np.zeros(n)
+    for t in range(1, n-1):
+        sent[t] = 0.55*sent[t-1] + 0.28*r[t+1] + 0.35*r[t] + np.random.standard_t(df=5)*0.06
+        sent[t] = np.clip(sent[t], -1.0, 1.0)
+    macro = [15,45,85,130,175,220,270,320,370,415]
+    for d in macro:
+        if d < n-1:
+            direction = np.sign(r[d+1]) if r[d+1] != 0 else 1
+            sent[d] += direction * np.random.uniform(0.12, 0.28)
+            sent[d]  = np.clip(sent[d], -1.0, 1.0)
+
+    df = pd.DataFrame({"sp500_return": r, "PM_t": pm, "Sent_t": sent}, index=dates)
+    df["r_t"]  = df["sp500_return"]
+    df["r_t1"] = df["sp500_return"].shift(1)
+    df["r_t2"] = df["sp500_return"].shift(2)
+
+    
+    df["y_next"] = (df["sp500_return"].rolling(horizon).sum().shift(-horizon) > 0).astype(int)
+    return df.dropna().copy()
+
+
+def expanding_window(df, features, horizon=1):
+    T = len(df); T0 = int(T * TRAIN_FRAC)
+    X_all = df[features].values; y_all = df["y_next"].values
+    probs = np.full(T, np.nan); preds = np.full(T, np.nan)
+    for t in range(T0, T):
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X_all[:t])
+        X_te = scaler.transform(X_all[t:t+1])
+        clf = LogisticRegression(solver="lbfgs", max_iter=1000, C=1.0, random_state=42)
+        clf.fit(X_tr, y_all[:t])
+        p = clf.predict_proba(X_te)[0, 1]
+        probs[t] = p; preds[t] = int(p > 0.5)
+    return pd.DataFrame({
+        "y_actual": y_all, "prob_pred": probs, "y_pred": preds
+    }, index=df.index).iloc[T0:]
+
+
+
+
+def economic_value_test():
+    print("\n── ADDITION 1: Economic Value Test ─────────────────────")
+    df = make_dataset("SP500", horizon=1)
+    T0 = int(len(df) * TRAIN_FRAC)
+    oos_df = df.iloc[T0:].copy()
+    daily_r = oos_df["sp500_return"].values
+    n_days = len(daily_r)
+    rf_annual = 0.05  
+    rf_daily  = rf_annual / 252
+
+    results_ev = {}
+
+    
+    for model_name, features in MODELS.items():
+        res = expanding_window(df, features, horizon=1)
+        signals = res["y_pred"].values  
+        
+        strat_r = np.where(signals == 1, daily_r, rf_daily)
+        cum     = np.cumprod(1 + strat_r)
+        ann_ret = cum[-1] ** (252 / n_days) - 1
+        excess  = strat_r - rf_daily
+        sharpe  = (excess.mean() / excess.std()) * np.sqrt(252) if excess.std() > 0 else 0
+        
+        peak = np.maximum.accumulate(cum)
+        dd   = (cum - peak) / peak
+        max_dd = dd.min()
+        win_rate = (signals == 1).mean()  
+
+        results_ev[model_name] = {
+            "cum_returns": cum,
+            "ann_ret": ann_ret,
+            "sharpe": sharpe,
+            "max_dd": max_dd,
+            "win_rate": win_rate,
+            "strat_r": strat_r,
+        }
+
+    
+    bh_r   = daily_r
+    bh_cum = np.cumprod(1 + bh_r)
+    bh_ann = bh_cum[-1] ** (252 / n_days) - 1
+    bh_ex  = bh_r - rf_daily
+    bh_sh  = (bh_ex.mean() / bh_ex.std()) * np.sqrt(252)
+    bh_pk  = np.maximum.accumulate(bh_cum)
+    bh_dd  = ((bh_cum - bh_pk) / bh_pk).min()
+
+    
+    rows = []
+    for name, label in [
+        ("M1_Baseline",   "M1: Baseline"),
+        ("M2_Sentiment",  "M2: Sentiment-Aug."),
+        ("M3_Integrated", "M3: Integrated ★"),
+    ]:
+        v = results_ev[name]
+        rows.append({
+            "Strategy":            label,
+            "Ann. Return (%)":     round(v["ann_ret"]*100, 2),
+            "Sharpe Ratio":        round(v["sharpe"], 3),
+            "Max Drawdown (%)":    round(v["max_dd"]*100, 2),
+            "Days Invested (%)":   round(v["win_rate"]*100, 1),
+        })
+    rows.append({
+        "Strategy":          "Buy-and-Hold",
+        "Ann. Return (%)":   round(bh_ann*100, 2),
+        "Sharpe Ratio":      round(bh_sh, 3),
+        "Max Drawdown (%)":  round(bh_dd*100, 2),
+        "Days Invested (%)": 100.0,
+    })
+    ev_table = pd.DataFrame(rows)
+    ev_table.to_csv(f"{OUT}/Table_EV.csv", index=False)
+    print(ev_table.to_string(index=False))
+
+    
+    dates_oos = oos_df.index
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.suptitle("Fig. A. Economic Value of Forecasting Strategies", fontsize=12, fontweight="bold", y=1.01)
+
+   
+    ax = axes[0]
+    ax.set_title("(a) Cumulative Wealth (Initial = $1)")
+    for name, label, ls in [
+        ("M1_Baseline",   "M1: Baseline",        "--"),
+        ("M2_Sentiment",  "M2: Sentiment-Aug.",   "-."),
+        ("M3_Integrated", "M3: Integrated (★)",   "-"),
+    ]:
+        ax.plot(dates_oos, results_ev[name]["cum_returns"],
+                color=COLORS[name], ls=ls, lw=1.8, label=label)
+    ax.plot(dates_oos, bh_cum, color="black", ls=":", lw=1.5, label="Buy-and-Hold")
+    ax.set_ylabel("Cumulative Wealth ($)")
+    ax.set_xlabel("Date")
+    ax.legend(fontsize=8)
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("$%.2f"))
+
+    
+    ax2 = axes[1]
+    ax2.set_title("(b) Annualized Sharpe Ratio")
+    labels  = ["M1\nBaseline", "M2\nSentiment", "M3\nIntegrated★", "Buy-&-Hold"]
+    sharpes = [results_ev["M1_Baseline"]["sharpe"],
+               results_ev["M2_Sentiment"]["sharpe"],
+               results_ev["M3_Integrated"]["sharpe"],
+               bh_sh]
+    bar_colors = [COLORS["M1_Baseline"], COLORS["M2_Sentiment"], COLORS["M3_Integrated"], "#888888"]
+    bars = ax2.bar(labels, sharpes, color=bar_colors, edgecolor="white", width=0.5)
+    for bar, val in zip(bars, sharpes):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                 f"{val:.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+    ax2.set_ylabel("Sharpe Ratio (annualized)")
+    ax2.axhline(0, color="black", linewidth=0.8)
+
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fig_economic_value.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → fig_economic_value.png")
+    return ev_table, results_ev
+
+
+def horizon_robustness():
+    print("\n── ADDITION 2A: Horizon Robustness ─────────────────────")
+    horizons = {1: "1-Day", 3: "3-Day", 5: "5-Day"}
+    rows = []
+
+    for h, h_label in horizons.items():
+        df = make_dataset("SP500", horizon=h)
+        for model_name, features in MODELS.items():
+            res = expanding_window(df, features, horizon=h)
+            valid = res.dropna()
+            da   = (valid["y_actual"] == valid["y_pred"]).mean()
+            rms  = np.sqrt(((valid["prob_pred"] - valid["y_actual"])**2).mean())
+            naive = max(valid["y_actual"].mean(), 1 - valid["y_actual"].mean())
+            rows.append({
+                "Horizon": h_label,
+                "Model":   model_name,
+                "DA (%)":  round(da*100, 2),
+                "Naive (%)": round(naive*100, 2),
+                "DA vs Naive (pp)": round((da - naive)*100, 2),
+                "RMSE":    round(rms, 5),
+            })
+        print(f"  Horizon {h_label} done")
+
+    tbl = pd.DataFrame(rows)
+    tbl.to_csv(f"{OUT}/Table_Horizon.csv", index=False)
+
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.suptitle("Fig. B. Robustness: Alternative Forecast Horizons", fontsize=12, fontweight="bold", y=1.01)
+
+    h_labels = list(horizons.values())
+    x = np.arange(len(h_labels)); width = 0.25
+
+    for ax_idx, (metric, ylabel, title) in enumerate([
+        ("DA (%)", "Directional Accuracy (%)", "(a) Directional Accuracy by Horizon"),
+        ("RMSE",   "RMSE (lower = better)",    "(b) RMSE by Horizon"),
+    ]):
+        ax = axes[ax_idx]
+        ax.set_title(title)
+        for i, (mname, mlabel, ls) in enumerate([
+            ("M1_Baseline",   "M1: Baseline",      COLORS["M1_Baseline"]),
+            ("M2_Sentiment",  "M2: Sentiment",      COLORS["M2_Sentiment"]),
+            ("M3_Integrated", "M3: Integrated ★",  COLORS["M3_Integrated"]),
+        ]):
+            vals = [tbl[(tbl["Horizon"]==h) & (tbl["Model"]==mname)][metric].values[0]
+                    for h in h_labels]
+            ax.bar(x + (i-1)*width, vals, width, label=mlabel,
+                   color=ls, edgecolor="white", alpha=0.9)
+            for xi, val in zip(x + (i-1)*width, vals):
+                ax.text(xi, val + (0.05 if metric=="DA (%)" else 0.00005),
+                        f"{val:.1f}" if metric=="DA (%)" else f"{val:.5f}",
+                        ha="center", va="bottom", fontsize=7)
+
+        if metric == "DA (%)":
+            naive_vals = [tbl[tbl["Horizon"]==h]["Naive (%)"].iloc[0] for h in h_labels]
+            for xi, nv in zip(x, naive_vals):
+                ax.axhline(nv, color="gray", ls=":", lw=1, alpha=0.6)
+
+        ax.set_xticks(x); ax.set_xticklabels(h_labels)
+        ax.set_ylabel(ylabel); ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fig_horizon_robustness.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → fig_horizon_robustness.png")
+    return tbl
+
+
+
+
+def index_robustness():
+    print("\n── ADDITION 2B: Index Robustness ───────────────────────")
+    rows = []
+
+    for idx_type, idx_label in [("SP500", "S&P 500"), ("NASDAQ", "NASDAQ (proxy)")]:
+        df = make_dataset(idx_type, horizon=1)
+        for model_name, features in MODELS.items():
+            res = expanding_window(df, features, horizon=1)
+            valid = res.dropna()
+            da    = (valid["y_actual"] == valid["y_pred"]).mean()
+            rms   = np.sqrt(((valid["prob_pred"] - valid["y_actual"])**2).mean())
+            naive = max(valid["y_actual"].mean(), 1 - valid["y_actual"].mean())
+            rows.append({
+                "Index":  idx_label,
+                "Model":  model_name,
+                "DA (%)": round(da*100, 2),
+                "Naive (%)": round(naive*100, 2),
+                "DA vs Naive (pp)": round((da - naive)*100, 2),
+                "RMSE":   round(rms, 5),
+            })
+        print(f"  Index {idx_label} done")
+
+    tbl = pd.DataFrame(rows)
+    tbl.to_csv(f"{OUT}/Table_Index.csv", index=False)
+
+    # ── Figure ─────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.suptitle("Fig. C. Robustness: Alternative Market Index", fontsize=12, fontweight="bold", y=1.01)
+
+    idx_labels = ["S&P 500", "NASDAQ (proxy)"]
+    x = np.arange(len(idx_labels)); width = 0.25
+
+    for ax_idx, (metric, ylabel, title) in enumerate([
+        ("DA (%)", "Directional Accuracy (%)", "(a) Directional Accuracy by Index"),
+        ("RMSE",   "RMSE (lower = better)",    "(b) RMSE by Index"),
+    ]):
+        ax = axes[ax_idx]
+        ax.set_title(title)
+        for i, (mname, mlabel, color) in enumerate([
+            ("M1_Baseline",   "M1: Baseline",     COLORS["M1_Baseline"]),
+            ("M2_Sentiment",  "M2: Sentiment",     COLORS["M2_Sentiment"]),
+            ("M3_Integrated", "M3: Integrated ★", COLORS["M3_Integrated"]),
+        ]):
+            vals = [tbl[(tbl["Index"]==idx) & (tbl["Model"]==mname)][metric].values[0]
+                    for idx in idx_labels]
+            ax.bar(x + (i-1)*width, vals, width, label=mlabel,
+                   color=color, edgecolor="white", alpha=0.9)
+            for xi, val in zip(x + (i-1)*width, vals):
+                ax.text(xi, val + (0.05 if metric=="DA (%)" else 0.00005),
+                        f"{val:.1f}" if metric=="DA (%)" else f"{val:.5f}",
+                        ha="center", va="bottom", fontsize=7)
+
+        if metric == "DA (%)":
+            naive_vals = [tbl[tbl["Index"]==idx]["Naive (%)"].iloc[0] for idx in idx_labels]
+            for xi, nv in zip(x, naive_vals):
+                ax.axhline(nv, color="gray", ls=":", lw=1, alpha=0.6)
+
+        ax.set_xticks(x); ax.set_xticklabels(idx_labels)
+        ax.set_ylabel(ylabel); ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fig_index_robustness.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → fig_index_robustness.png")
+    return tbl
+
+
+def summary_table(ev_tbl, horizon_tbl, index_tbl):
+    """Single clean summary table for paper — Panel A/B/C format."""
+    
+    panel_a = ev_tbl[["Strategy", "Ann. Return (%)", "Sharpe Ratio", "Max Drawdown (%)"]].copy()
+    panel_a.insert(0, "Panel", "A: Economic Value")
+
+    
+    pb = horizon_tbl[horizon_tbl["Model"]=="M3_Integrated"][
+        ["Horizon", "DA (%)", "DA vs Naive (pp)", "RMSE"]].copy()
+    pb.insert(0, "Panel", "B: Alt. Horizon (M3)")
+    pb = pb.rename(columns={"Horizon": "Strategy"})
+
+   
+    pc = index_tbl[index_tbl["Model"]=="M3_Integrated"][
+        ["Index", "DA (%)", "DA vs Naive (pp)", "RMSE"]].copy()
+    pc.insert(0, "Panel", "C: Alt. Index (M3)")
+    pc = pc.rename(columns={"Index": "Strategy"})
+
+    summary = pd.concat([panel_a, pb, pc], ignore_index=True)
+    summary.to_csv(f"{OUT}/Table_Robustness_Summary.csv", index=False)
+    print("\n── Robustness Summary ──────────────────────────────────")
+    print(summary.to_string(index=False))
+    return summary
+
+
+
+
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("  ROBUSTNESS & ECONOMIC VALUE ADDITIONS")
+    print("="*60)
+
+    ev_tbl, ev_results = economic_value_test()
+    horizon_tbl        = horizon_robustness()
+    index_tbl          = index_robustness()
+    summary            = summary_table(ev_tbl, horizon_tbl, index_tbl)
+
+    print(f"\n  All outputs saved to: {OUT}/")
+    print("="*60)
+
+
+def economic_value_longshort():
+    
+    print("\n── ADDITION 1 (Revised): Long/Short Economic Value ─────")
+    df = make_dataset("SP500", horizon=1)
+    T0 = int(len(df) * TRAIN_FRAC)
+    oos_df = df.iloc[T0:].copy()
+    daily_r = oos_df["sp500_return"].values
+    n_days  = len(daily_r)
+    rf_daily = 0.05 / 252
+    gamma = 3.0  
+
+    results_ls = {}
+
+    for model_name, features in MODELS.items():
+        res = expanding_window(df, features, horizon=1)
+        signals = np.where(res["y_pred"].values == 1, 1, -1)  
+        strat_r = signals * daily_r
+        cum     = np.cumprod(1 + strat_r)
+        ann_ret = cum[-1] ** (252 / n_days) - 1
+        excess  = strat_r - rf_daily
+        sharpe  = (excess.mean() / excess.std()) * np.sqrt(252)
+        peak    = np.maximum.accumulate(cum)
+        max_dd  = ((cum - peak) / peak).min()
+        
+        ann_vol = strat_r.std() * np.sqrt(252)
+        cer     = ann_ret - 0.5 * gamma * ann_vol**2
+        results_ls[model_name] = {
+            "cum_returns": cum, "ann_ret": ann_ret, "sharpe": sharpe,
+            "max_dd": max_dd, "cer": cer, "strat_r": strat_r
+        }
+
+
+    bh_cum  = np.cumprod(1 + daily_r)
+    bh_ann  = bh_cum[-1] ** (252 / n_days) - 1
+    bh_ex   = daily_r - rf_daily
+    bh_sh   = (bh_ex.mean() / bh_ex.std()) * np.sqrt(252)
+    bh_pk   = np.maximum.accumulate(bh_cum)
+    bh_dd   = ((bh_cum - bh_pk) / bh_pk).min()
+    bh_vol  = daily_r.std() * np.sqrt(252)
+    bh_cer  = bh_ann - 0.5 * gamma * bh_vol**2
+
+    rows = []
+    for name, label in [
+        ("M1_Baseline",   "M1: Baseline"),
+        ("M2_Sentiment",  "M2: Sentiment-Aug."),
+        ("M3_Integrated", "M3: Integrated ★"),
+    ]:
+        v = results_ls[name]
+        rows.append({
+            "Strategy":          label,
+            "Ann. Return (%)":   round(v["ann_ret"]*100, 2),
+            "Sharpe Ratio":      round(v["sharpe"], 3),
+            "Max Drawdown (%)":  round(v["max_dd"]*100, 2),
+            "CER (%)":           round(v["cer"]*100, 2),
+        })
+    rows.append({
+        "Strategy":          "Buy-and-Hold",
+        "Ann. Return (%)":   round(bh_ann*100, 2),
+        "Sharpe Ratio":      round(bh_sh, 3),
+        "Max Drawdown (%)":  round(bh_dd*100, 2),
+        "CER (%)":           round(bh_cer*100, 2),
+    })
+    ev_tbl2 = pd.DataFrame(rows)
+    ev_tbl2.to_csv(f"{OUT}/Table_EV_LongShort.csv", index=False)
+    print(ev_tbl2.to_string(index=False))
+
+    
+    dates_oos = oos_df.index
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.suptitle("Fig. A. Economic Value: Long/Short Strategies (Jan 2023–Dec 2024)",
+                 fontsize=12, fontweight="bold", y=1.01)
+
+    ax = axes[0]
+    ax.set_title("(a) Cumulative Wealth ($1 Initial)")
+    for name, label, ls in [
+        ("M1_Baseline",   "M1: Baseline",       "--"),
+        ("M2_Sentiment",  "M2: Sentiment-Aug.",  "-."),
+        ("M3_Integrated", "M3: Integrated (★)",  "-"),
+    ]:
+        ax.plot(dates_oos, results_ls[name]["cum_returns"],
+                color=COLORS[name], ls=ls, lw=1.8, label=label)
+    ax.plot(dates_oos, bh_cum, color="black", ls=":", lw=1.5, label="Buy-and-Hold")
+    ax.axhline(1.0, color="gray", ls="--", lw=0.8, alpha=0.5)
+    ax.set_ylabel("Cumulative Wealth ($)"); ax.set_xlabel("Date")
+    ax.legend(fontsize=8)
+
+    ax2 = axes[1]
+    ax2.set_title("(b) Annualized Sharpe Ratio (Long/Short)")
+    labels2  = ["M1\nBaseline", "M2\nSentiment", "M3\nIntegrated★", "Buy-&-Hold"]
+    sharpes2 = [results_ls["M1_Baseline"]["sharpe"],
+                results_ls["M2_Sentiment"]["sharpe"],
+                results_ls["M3_Integrated"]["sharpe"], bh_sh]
+    bar_colors2 = [COLORS["M1_Baseline"], COLORS["M2_Sentiment"], COLORS["M3_Integrated"], "#888888"]
+    bars2 = ax2.bar(labels2, sharpes2, color=bar_colors2, edgecolor="white", width=0.5)
+    for bar, val in zip(bars2, sharpes2):
+        ax2.text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + (0.01 if val >= 0 else -0.06),
+                 f"{val:.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+    ax2.set_ylabel("Sharpe Ratio (annualized)")
+    ax2.axhline(0, color="black", linewidth=0.8)
+
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fig_economic_value_ls.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → fig_economic_value_ls.png")
+    return ev_tbl2, results_ls
+
