@@ -1,0 +1,253 @@
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+
+DATA_FILE   = "data/raw_data.csv"    
+RESULTS_DIR = "results"              
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def table1_descriptive(df: pd.DataFrame) -> pd.DataFrame:
+    
+    cols = {
+        "sp500_return" : "S&P 500 Return (r_t)",
+        "PM_t"         : "Polymarket ΔProbability (PM_t)",
+        "Sent_t"       : "FinBERT Sentiment (Sent_t)",
+    }
+
+    rows = []
+    for col, label in cols.items():
+        s = df[col].dropna()  
+
+        rows.append({
+            "Variable" : label,
+            "N"        : len(s),                          
+            "Mean"     : round(s.mean(), 5),              
+            "Std Dev"  : round(s.std(),  5),              
+            "Min"      : round(s.min(),  5),              
+            "P25"      : round(s.quantile(0.25), 5),      
+            "Median"   : round(s.median(), 5),            
+            "P75"      : round(s.quantile(0.75), 5),      
+            "Max"      : round(s.max(),  5),              
+            "Skewness" : round(s.skew(), 4),              
+            "Kurtosis" : round(s.kurt(), 4),              
+        })
+
+    t = pd.DataFrame(rows)
+    t.to_csv(os.path.join(RESULTS_DIR, "Table1_DescriptiveStats.csv"), index=False)
+    print("  Saved → Table1_DescriptiveStats.csv")
+    return t
+
+
+def table2_performance(metrics: pd.DataFrame) -> pd.DataFrame:
+    
+    model_display = {
+        "M1_Baseline"   : "M1: Baseline (Price Lags Only)",
+        "M2_Sentiment"  : "M2: Sentiment-Augmented",
+        "M3_Integrated" : "M3: Information-Integrated (Proposed)",
+    }
+
+
+    features_display = {
+        "M1_Baseline"   : "r_t, r_{t-1}, r_{t-2}",
+        "M2_Sentiment"  : "r_t, r_{t-1}, r_{t-2}, Sent_t",
+        "M3_Integrated" : "r_t, r_{t-1}, r_{t-2}, Sent_t, PM_t",
+    }
+
+    rows = []
+    for _, row in metrics.iterrows():
+        m = row["Model"]
+        rows.append({
+            "Model"               : model_display.get(m, m),
+            "Features"            : features_display.get(m, ""),
+            "N (out-of-sample)"   : int(row["N_test"]),
+            "Directional Acc. (%)": f"{row['DA (%)']:.2f}",
+            "Naive Benchmark (%)" : f"{row['Naive_DA (%)']:.2f}",
+            "DA vs Naive (pp)"    : f"{row['DA_vs_Naive (pp)']:+.2f}",  
+            "RMSE"                : f"{row['RMSE']:.5f}",
+        })
+
+    t = pd.DataFrame(rows)
+    t.to_csv(os.path.join(RESULTS_DIR, "Table2_ForecastPerformance.csv"), index=False)
+    print("  Saved → Table2_ForecastPerformance.csv")
+    return t
+
+
+
+def table3_dm(dm: pd.DataFrame) -> pd.DataFrame:
+    dm_out = dm.copy()
+
+    
+    dm_out.columns = [
+        "Comparison",
+        "DM Statistic",
+        "p-value",
+        "Significant at 5%",
+        "Preferred Model",
+    ]
+
+    def stars(p):
+        try:
+            p = float(p)
+            if p < 0.01: return "***"
+            if p < 0.05: return "**"
+            if p < 0.10: return "*"
+            return ""   
+        except Exception:
+            return ""
+
+    dm_out["Significance"] = dm_out["p-value"].apply(stars)
+
+    
+    note = pd.DataFrame([{
+        "Comparison"        : "Note: Harvey et al. (1997) small-sample corrected DM statistic.",
+        "DM Statistic"      : "*** p<0.01",
+        "p-value"           : "** p<0.05",
+        "Significant at 5%" : "* p<0.10",
+        "Preferred Model"   : "",
+        "Significance"      : "",
+    }])
+
+    t = pd.concat([dm_out, note], ignore_index=True)
+    t.to_csv(os.path.join(RESULTS_DIR, "Table3_DM_Tests.csv"), index=False)
+    print("  Saved → Table3_DM_Tests.csv")
+    return dm_out
+
+
+
+
+def table4_coefficients(df: pd.DataFrame) -> pd.DataFrame:
+    
+    MODELS = {
+        "M1_Baseline"   : ["r_t", "r_t1", "r_t2"],
+        "M2_Sentiment"  : ["r_t", "r_t1", "r_t2", "Sent_t"],
+        "M3_Integrated" : ["r_t", "r_t1", "r_t2", "Sent_t", "PM_t"],
+    }
+
+ 
+    FEAT_LABELS = {
+        "r_t"   : "r_t (current return)",
+        "r_t1"  : "r_{t-1} (lag 1)",
+        "r_t2"  : "r_{t-2} (lag 2)",
+        "Sent_t": "Sent_t (FinBERT)",
+        "PM_t"  : "PM_t (Polymarket)",
+    }
+
+    T  = len(df)
+    T0 = int(T * 0.80)   
+
+    rows = []
+
+    for model_name, features in MODELS.items():
+        X_all = df[features].values
+        y_all = df["y_next"].values
+
+        
+        coefs = {f: [] for f in features}
+        intercepts = []
+
+        
+        for t in range(T0, T):
+            
+            X_train = X_all[:t]
+            y_train = y_all[:t]
+
+            
+            scaler  = StandardScaler()
+            X_s     = scaler.fit_transform(X_train)
+
+           
+            clf = LogisticRegression(solver="lbfgs", max_iter=1000, C=1.0)
+            clf.fit(X_s, y_train)
+
+           
+            for i, f in enumerate(features):
+                coefs[f].append(clf.coef_[0][i])
+            intercepts.append(clf.intercept_[0])
+
+        
+        for f in features:
+            c_arr = np.array(coefs[f])
+            mean  = c_arr.mean()   
+            std   = c_arr.std()    
+
+           
+            tstat = mean / std if std > 0 else np.nan
+
+            rows.append({
+                "Model"      : model_name,
+                "Variable"   : FEAT_LABELS.get(f, f),
+                "Mean Coef." : round(mean, 4),
+                "Std Dev"    : round(std, 4),
+                "t-stat"     : round(tstat, 3),
+                
+                "Sig."       : "***" if abs(tstat) > 2.576 else  
+                               "**"  if abs(tstat) > 1.960 else  
+                               "*"   if abs(tstat) > 1.645 else  
+                               "",                                 
+            })
+
+    t = pd.DataFrame(rows)
+    t.to_csv(os.path.join(RESULTS_DIR, "Table4_Coefficients.csv"), index=False)
+    print("  Saved → Table4_Coefficients.csv")
+    return t
+
+
+def save_excel_workbook(t1, t2, t3, t4):
+    
+    path = os.path.join(RESULTS_DIR, "All_Tables.xlsx")
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for sheet_name, tbl in [
+            ("Table1_DescStats",   t1),
+            ("Table2_Performance", t2),
+            ("Table3_DM_Tests",    t3),
+            ("Table4_Coefficients",t4),
+        ]:
+            tbl.to_excel(writer, sheet_name=sheet_name, index=False)
+
+           
+            ws = writer.sheets[sheet_name]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value)) if cell.value else 0
+                              for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+
+    print(f"  Saved → {path}")
+
+def main():
+    print("\n" + "="*60)
+    print("  GENERATING PUBLICATION-READY TABLES")
+    print("="*60)
+
+    
+    df      = pd.read_csv(DATA_FILE, index_col="date", parse_dates=True)
+    metrics = pd.read_csv(os.path.join(RESULTS_DIR, "summary_metrics.csv"))
+    dm      = pd.read_csv(os.path.join(RESULTS_DIR, "dm_tests.csv"))
+
+    
+    t1 = table1_descriptive(df)       
+    t2 = table2_performance(metrics)  
+    t3 = table3_dm(dm)                
+    t4 = table4_coefficients(df)      
+
+
+    save_excel_workbook(t1, t2, t3, t4)
+
+    
+    print("\n── Table 2 Preview (Main Results) ──────────────────────")
+    print(t2[["Model", "Directional Acc. (%)", "DA vs Naive (pp)", "RMSE"]].to_string(index=False))
+
+    print("\n── Table 3 Preview (DM Tests) ───────────────────────────")
+    print(t3[["Comparison", "DM Statistic", "p-value", "Significance"]].to_string(index=False))
+    print("="*60 + "\n")
+
+
+
+if __name__ == "__main__":
+    main()
